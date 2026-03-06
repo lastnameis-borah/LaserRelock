@@ -1,0 +1,12 @@
+[project]
+name = "laserrelock"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "pylablib>=1.4.4",
+    "pyueye>=4.96.952",
+    "toptica-lasersdk>=3.3.0",
+]
