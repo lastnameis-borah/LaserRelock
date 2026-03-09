@@ -3,66 +3,123 @@ Camera Server for Thorlabs DCC1545M
 ====================================
 Run this on the Windows server PC where the camera is USB-connected.
 
-Requirements:
-    pip install pyueye numpy
+Uses the uc480 driver directly via ctypes — no pyueye needed.
+Only requires: numpy (pip install numpy)
 
-Note: This should work alongside ThorCam (the IDS uEye daemon
-supports shared access). If you get an init error, try closing ThorCam.
+The uc480_64.dll is already in C:\\Windows\\System32 from the
+Thorlabs DCx Camera Support installation.
 """
 
+import ctypes
 import socket
 import struct
 import sys
 import numpy as np
-from pyueye import ueye
 
-# ─── Configuration ───
-HOST = '0.0.0.0'       # Listen on all interfaces
-PORT = 5556             # Camera server port
+# ─── Camera specs (DCC1545M) ───
+WIDTH = 1280
+HEIGHT = 1024
+
+# ─── uc480 constants ───
+IS_SUCCESS = 0
+IS_CM_MONO8 = 6
+IS_WAIT = 0x0001
+IS_SET_DM_DIB = 1
+
+# ─── Server config ───
+HOST = '0.0.0.0'
+PORT = 5556
+
+# ─── Load uc480 DLL ───
+try:
+    dll = ctypes.cdll.LoadLibrary("uc480_64")
+except OSError:
+    try:
+        dll = ctypes.cdll.LoadLibrary("uc480")
+    except OSError:
+        sys.exit("Error: Could not load uc480 DLL. Is the Thorlabs DCx driver installed?")
+
+print("uc480 DLL loaded successfully.")
+
+# ─── Set up function signatures for 64-bit safety ───
+HIDS = ctypes.c_uint32
+
+dll.is_InitCamera.argtypes = [ctypes.POINTER(HIDS), ctypes.c_void_p]
+dll.is_InitCamera.restype = ctypes.c_int
+
+dll.is_SetDisplayMode.argtypes = [HIDS, ctypes.c_int]
+dll.is_SetDisplayMode.restype = ctypes.c_int
+
+dll.is_SetColorMode.argtypes = [HIDS, ctypes.c_int]
+dll.is_SetColorMode.restype = ctypes.c_int
+
+dll.is_AllocImageMem.argtypes = [HIDS, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                  ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_int)]
+dll.is_AllocImageMem.restype = ctypes.c_int
+
+dll.is_SetImageMem.argtypes = [HIDS, ctypes.c_char_p, ctypes.c_int]
+dll.is_SetImageMem.restype = ctypes.c_int
+
+dll.is_FreezeVideo.argtypes = [HIDS, ctypes.c_int]
+dll.is_FreezeVideo.restype = ctypes.c_int
+
+dll.is_CopyImageMem.argtypes = [HIDS, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
+dll.is_CopyImageMem.restype = ctypes.c_int
+
+dll.is_FreeImageMem.argtypes = [HIDS, ctypes.c_char_p, ctypes.c_int]
+dll.is_FreeImageMem.restype = ctypes.c_int
+
+dll.is_ExitCamera.argtypes = [HIDS]
+dll.is_ExitCamera.restype = ctypes.c_int
 
 
 def init_camera():
-    """Initialize the DCC1545M camera and return handles."""
-    hCam = ueye.HIDS(0)  # 0 = first available camera
-    ret = ueye.is_InitCamera(hCam, None)
-    if ret != ueye.IS_SUCCESS:
-        sys.exit(f"Camera init failed (error code {ret}). Is ThorCam closed?")
+    """Initialize the DCC1545M camera."""
+    hCam = HIDS(0)  # 0 = first available camera
+    ret = dll.is_InitCamera(ctypes.byref(hCam), None)
+    if ret != IS_SUCCESS:
+        sys.exit(f"Camera init failed (code {ret}). Is the camera connected? Is ThorCam using it?")
 
-    # Get sensor info
-    sInfo = ueye.SENSORINFO()
-    ueye.is_GetSensorInfo(hCam, sInfo)
-    width = sInfo.nMaxWidth
-    height = sInfo.nMaxHeight
+    # DIB mode = capture to memory (no display window needed)
+    dll.is_SetDisplayMode(hCam, IS_SET_DM_DIB)
 
-    # Set monochrome 8-bit mode
-    ueye.is_SetColorMode(hCam, ueye.IS_CM_MONO8)
+    # Monochrome 8-bit
+    dll.is_SetColorMode(hCam, IS_CM_MONO8)
 
     # Allocate image memory
-    mem_ptr = ueye.c_mem_p()
-    mem_id = ueye.INT()
-    ret = ueye.is_AllocImageMem(hCam, width, height, 8, mem_ptr, mem_id)
-    if ret != ueye.IS_SUCCESS:
-        sys.exit(f"Memory allocation failed (error code {ret})")
+    mem_ptr = ctypes.c_char_p()
+    mem_id = ctypes.c_int()
+    ret = dll.is_AllocImageMem(hCam, WIDTH, HEIGHT, 8,
+                                ctypes.byref(mem_ptr), ctypes.byref(mem_id))
+    if ret != IS_SUCCESS:
+        sys.exit(f"Memory allocation failed (code {ret})")
 
-    ueye.is_SetImageMem(hCam, mem_ptr, mem_id)
+    ret = dll.is_SetImageMem(hCam, mem_ptr, mem_id)
+    if ret != IS_SUCCESS:
+        sys.exit(f"Set image memory failed (code {ret})")
 
-    print(f"Camera initialized: {width.value}x{height.value} Mono8")
-    return hCam, mem_ptr, mem_id, width, height
+    print(f"Camera initialized: {WIDTH}x{HEIGHT} Mono8")
+    return hCam, mem_ptr, mem_id
 
 
-def capture_frame(hCam, mem_ptr, width, height):
+def capture_frame(hCam, mem_ptr, mem_id):
     """Capture a single frame and return as numpy array."""
-    ret = ueye.is_FreezeVideo(hCam, ueye.IS_WAIT)
-    if ret != ueye.IS_SUCCESS:
+    ret = dll.is_FreezeVideo(hCam, IS_WAIT)
+    if ret != IS_SUCCESS:
         return None
 
-    array = ueye.get_data(mem_ptr, width, height, 8, copy=True)
-    frame = np.reshape(array, (height.value, width.value))
+    # Copy pixel data to our buffer
+    buf = (ctypes.c_char * (WIDTH * HEIGHT))()
+    ret = dll.is_CopyImageMem(hCam, mem_ptr, mem_id, buf)
+    if ret != IS_SUCCESS:
+        return None
+
+    frame = np.frombuffer(buf, dtype=np.uint8).reshape(HEIGHT, WIDTH)
     return frame
 
 
 def main():
-    hCam, mem_ptr, mem_id, width, height = init_camera()
+    hCam, mem_ptr, mem_id = init_camera()
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -78,19 +135,17 @@ def main():
             print(f"Client connected: {addr}")
             try:
                 while True:
-                    # Wait for frame request from client
+                    # Wait for frame request
                     req = conn.recv(5)
                     if not req or req != b'FRAME':
                         break
 
-                    # Capture frame
-                    frame = capture_frame(hCam, mem_ptr, width, height)
+                    # Capture and send frame
+                    frame = capture_frame(hCam, mem_ptr, mem_id)
                     if frame is None:
-                        # Send zero-size to indicate error
                         conn.sendall(struct.pack('>II', 0, 0))
                         continue
 
-                    # Send: height (4 bytes) + width (4 bytes) + raw pixel data
                     h, w = frame.shape
                     header = struct.pack('>II', h, w)
                     conn.sendall(header + frame.tobytes())
@@ -104,9 +159,8 @@ def main():
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
-        ueye.is_StopLiveVideo(hCam, ueye.IS_FORCE_VIDEO_STOP)
-        ueye.is_FreeImageMem(hCam, mem_ptr, mem_id)
-        ueye.is_ExitCamera(hCam)
+        dll.is_FreeImageMem(hCam, mem_ptr, mem_id)
+        dll.is_ExitCamera(hCam)
         server.close()
         print("Camera released.")
 
