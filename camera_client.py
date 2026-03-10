@@ -17,7 +17,7 @@ import matplotlib.animation as animation
 
 # ─── Configuration ───
 # Set this to the IP of your server PC (where camera_server.py is running)
-SERVER_IP = "172.29.13.XXX"   # <-- UPDATE THIS
+SERVER_IP = "172.29.13.140"   # IP of the windows PC
 SERVER_PORT = 5556
 POLL_INTERVAL = 200           # ms between frame requests
 
