@@ -22,8 +22,8 @@ FREQ_MIN = 434.829035
 FREQ_MAX = 434.829045
 
 # Piezo safety params
-VOLTAGE_MIN = 25.0  # V
-VOLTAGE_MAX = 35.0  # V
+VOLTAGE_MIN = 20.0  # V
+VOLTAGE_MAX = 50.0  # V
 STEP_SIZE_V = 0.01  # 10mV
 DELAY = 0.2         # s
 

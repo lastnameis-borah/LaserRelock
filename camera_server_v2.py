@@ -1,19 +1,3 @@
-"""
-Camera Server v2 for Thorlabs DCC1545M
-========================================
-Run this on the Windows server PC where the camera is USB-connected.
-Replaces ThorCam — shows a local display AND serves frames to remote clients.
-
-Uses the uc480 driver directly via ctypes (no pyueye needed).
-Only requires: numpy, matplotlib
-
-Usage:
-    python camera_server_v2.py
-
-The local window shows the live camera feed with intensity stats.
-Remote clients connect on port 5556 to receive frames.
-"""
-
 import ctypes
 import socket
 import struct
