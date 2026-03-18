@@ -1,5 +1,6 @@
 import time
 import sys
+import csv
 import wlmData
 import wlmConst
 import matplotlib.pyplot as plt
@@ -10,12 +11,13 @@ from toptica.lasersdk.dlcpro.v2_0_3 import DLCpro, NetworkConnection
 
 # ─── Configuration ───
 DLL_PATH = "/usr/lib/libwlmData.so"
-CHANNEL = 8
+CHANNEL = 3
 
 # Toptica DLC Pro settings
 TOPTICA_IP = "172.29.13.247"
 TOPTICA_PORT = 1998
 LASER_NAME = "testbed689"
+OUTPUT_FILE = "relock_log_ch%d_%s.csv" % (CHANNEL, datetime.now().strftime("%Y%m%d_%H%M%S"))
 
 # Target Frequency Window (10 MHz)
 FREQ_MIN = 434.829035
@@ -28,15 +30,15 @@ STEP_SIZE_V = 0.01  # 10mV
 DELAY = 0.2         # s
 
 # Relock stability params
-STABLE_READINGS = 3         # Consecutive in-window readings before re-locking
-SETTLE_AFTER_LOCK = 3.0     # Seconds to wait after engaging lock
+STABLE_READINGS = 5         # Consecutive in-window readings before re-locking
+SETTLE_AFTER_LOCK = 5.0     # Seconds to wait after engaging lock
 MAX_RELOCK_ATTEMPTS = 5     # Max piezo-only attempts before mode recovery
 
-# Mode recovery params (diode current scan)
-CURRENT_SCAN_RANGE = 2.0    # mA total range to scan (±1.0 mA from operating point)
+# Mode recovery params
+CURRENT_SCAN_RANGE = 4.0    # mA range to scan (±2.0 mA from operating point)
 CURRENT_STEP = 0.1          # mA per step
-CURRENT_SETTLE = 0.5        # Seconds to wait after each current step
-MAX_MODE_RECOVERIES = 10     # Max mode recovery attempts before giving up
+CURRENT_SETTLE = 1.0        # Seconds to wait after each current step
+MAX_MODE_RECOVERIES = 10    # Max mode recovery attempts before giving up
 
 
 def load_wavemeter():
@@ -62,8 +64,7 @@ def get_frequency():
 def human_intervention(voltage):
     if voltage < VOLTAGE_MIN or voltage > VOLTAGE_MAX:
         print(f"\n[CRITICAL] Proposed voltage {voltage:.3f}V is out of safe bounds ({VOLTAGE_MIN}V - {VOLTAGE_MAX}V)!")
-        print("Human intervention required. Stopping automatic adjustments.")
-        input("Press Enter to exit...")
+        print("Human intervention required. Stopping auto-relocking.")
         sys.exit(1)
 
 
@@ -96,7 +97,7 @@ def scan_current_for_mode(dlc):
     current_min = operating_current - half_range
     current_max = operating_current + half_range
 
-    # Scan outward from operating point: +0.1, -0.1, +0.2, -0.2, ...
+    # Scan outward from operating point
     steps = int(half_range / CURRENT_STEP)
     for i in range(1, steps + 1):
         for direction in [+1, -1]:
@@ -126,8 +127,7 @@ def scan_current_for_mode(dlc):
             else:
                 diff_ghz = (freq - (FREQ_MIN + FREQ_MAX) / 2) * 1000
                 print(f"({diff_ghz:+.3f} GHz off)")
-
-    # Nothing found — restore original current
+                
     print(f"\n[MODE RECOVERY] No good mode found. Restoring current to {operating_current:.2f} mA")
     dlc.laser1.dl.cc.current_set.set(operating_current)
     time.sleep(CURRENT_SETTLE)
@@ -224,7 +224,7 @@ fig.subplots_adjust(left=0.10, right=0.95, top=0.93, bottom=0.08, hspace=0.25)
 
 # Frequency subplot (top)
 freq_line, = ax_freq.plot([], [], 'b-o', markersize=3, linewidth=1.2)
-ax_freq.set_ylabel("GHz")
+ax_freq.set_ylabel("MHz")
 ax_freq.set_title("Channel %d — Real-Time Frequency" % CHANNEL)
 ax_freq.grid(True, alpha=0.3)
 base_label = ax_freq.text(-0.01, 1.02, "", transform=ax_freq.transAxes, fontsize=10,
@@ -265,8 +265,14 @@ def main():
 
         t_start = datetime.now(timezone.utc)
 
+        csvfile = open(OUTPUT_FILE, "w", newline="")
+        writer = csv.writer(csvfile)
+        writer.writerow(["timestamp_utc", "channel", "frequency_THz", "piezo_V", "current_mA", "temp_C"])
+        log_count = 0
+        print(f"Logging to: {OUTPUT_FILE}")
+
         def update(frame):
-            nonlocal relock_attempts, mode_recoveries
+            nonlocal relock_attempts, mode_recoveries, log_count
             global freq_base, freq_band
 
             now = datetime.now(timezone.utc)
@@ -277,14 +283,14 @@ def main():
 
             if freq is not None:
                 if freq_base is None:
-                    freq_base = int(freq * 1000) / 1000.0
-                    base_label.set_text("+ %.3f THz" % freq_base)
-                    lo = (FREQ_MIN - freq_base) * 1000.0
-                    hi = (FREQ_MAX - freq_base) * 1000.0
+                    freq_base = int(freq * 10000) / 10000.0
+                    base_label.set_text("+ %.4f THz" % freq_base)
+                    lo = (FREQ_MIN - freq_base) * 1e6  # MHz
+                    hi = (FREQ_MAX - freq_base) * 1e6  # MHz
                     freq_band = ax_freq.axhspan(lo, hi, color='green', alpha=0.15, label='Target window')
                     ax_freq.legend(loc='upper right', fontsize=8)
 
-                offset_ghz = (freq - freq_base) * 1000.0
+                offset_ghz = (freq - freq_base) * 1e6  # MHz
                 times.append(elapsed)
                 freq_offsets.append(offset_ghz)
 
@@ -305,6 +311,21 @@ def main():
                 current_voltage = dlc.laser1.dl.pc.voltage_act.get()
                 lock_state = lock.state_txt.get()
                 print(f"Freq: {freq:.6f} THz | Piezo: {current_voltage:.3f} V | Lock: {lock_state}")
+
+                # Log to CSV
+                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                try:
+                    current_mA = dlc.laser1.dl.cc.current_act.get()
+                    temp_C = dlc.laser1.dl.tc.temp_act.get()
+                except Exception:
+                    current_mA = None
+                    temp_C = None
+                writer.writerow([now_str, CHANNEL, f"{freq:.6f}",
+                                 f"{current_voltage:.4f}" if current_voltage else "",
+                                 f"{current_mA:.4f}" if current_mA is not None else "",
+                                 f"{temp_C:.4f}" if temp_C is not None else ""])
+                csvfile.flush()
+                log_count += 1
 
                 if freq > FREQ_MAX or freq < FREQ_MIN:
                     # ── Stage 1: Piezo-only relock ──
@@ -375,6 +396,11 @@ def main():
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
+        try:
+            csvfile.close()
+            print(f"\n{log_count} readings saved to '{OUTPUT_FILE}'.")
+        except:
+            pass
         try:
             dlc.close()
         except:
