@@ -11,7 +11,7 @@ from toptica.lasersdk.dlcpro.v2_0_3 import DLCpro, NetworkConnection
 
 # ─── Configuration ───
 DLL_PATH = "/usr/lib/libwlmData.so"
-CHANNEL = 8                    # Wavemeter channel to read
+CHANNEL = 3                    # Wavemeter channel to read
 POLL_INTERVAL = 0.5            # Seconds
 OUTPUT_FILE = "freq_log_ch%d_%s.csv" % (CHANNEL, datetime.now().strftime("%Y%m%d_%H%M%S"))
 
