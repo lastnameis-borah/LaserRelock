@@ -14,12 +14,18 @@ import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import csv
+from datetime import datetime, timezone
 
 # ─── Configuration ───
 # Set this to the IP of your server PC (where camera_server.py is running)
 SERVER_IP = "172.29.13.140"   # IP of the windows PC
 SERVER_PORT = 5556
 POLL_INTERVAL = 200           # ms between frame requests
+
+# ROI for intensity calculation (x1, y1, x2, y2)
+ROI_X1, ROI_Y1 = 395, 430
+ROI_X2, ROI_Y2 = 595, 630
 
 
 def recv_exact(sock, n):
@@ -51,8 +57,8 @@ def main():
     print("Connected!\n")
 
     # ─── Set up plot ───
-    fig, (ax_img, ax_hist) = plt.subplots(1, 2, figsize=(14, 6),
-                                           gridspec_kw={'width_ratios': [3, 1]})
+    fig, (ax_img, ax_hist) = plt.subplots(1, 2, figsize=(20, 6),
+                                           gridspec_kw={'width_ratios': [1, 1]})
     fig.canvas.manager.set_window_title("Thorlabs DCC1545M — Cavity Transmission")
     fig.subplots_adjust(left=0.05, right=0.95, top=0.92, bottom=0.08, wspace=0.15)
 
@@ -61,10 +67,17 @@ def main():
 
     # Intensity history for time trace
     intensity_history = []
-    max_history = 200
+
+    # CSV logging
+    csv_filename = f"camera-{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    csv_file = open(csv_filename, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["timestamp_utc", "roi_mean", "roi_peak", "roi_total"])
+    log_count = 0
+    print(f"Logging to: {csv_filename}")
 
     def update(frame_num):
-        nonlocal img_display, cbar
+        nonlocal img_display, cbar, log_count
 
         try:
             # Request a frame
@@ -86,20 +99,29 @@ def main():
             plt.close('all')
             return
 
-        # ── Intensity statistics ──
-        total = np.sum(frame.astype(np.float64))
-        peak = int(np.max(frame))
-        mean = float(np.mean(frame))
+        # ── ROI intensity statistics ──
+        roi = frame[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
+        total = np.sum(roi.astype(np.float64))
+        peak = int(np.max(roi))
+        mean = float(np.mean(roi))
 
         intensity_history.append(mean)
-        if len(intensity_history) > max_history:
-            intensity_history.pop(0)
+
+        # Log to CSV
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        csv_writer.writerow([now_str, f"{mean:.2f}", peak, f"{total:.0f}"])
+        csv_file.flush()
+        log_count += 1
 
         # ── Update camera image ──
         ax_img.clear()
         img_display = ax_img.imshow(frame, cmap='inferno', vmin=0, vmax=255,
                                      aspect='equal')
-        ax_img.set_title(f"Mean: {mean:.1f}  |  Peak: {peak}  |  Total: {total:.0f}",
+        # Draw ROI rectangle
+        roi_rect = plt.Rectangle((ROI_X1, ROI_Y1), ROI_X2 - ROI_X1, ROI_Y2 - ROI_Y1,
+                                  linewidth=1.5, edgecolor='lime', facecolor='none')
+        ax_img.add_patch(roi_rect)
+        ax_img.set_title(f"ROI Mean: {mean:.1f}  |  Peak: {peak}  |  Total: {total:.0f}",
                          fontsize=11)
         ax_img.set_xlabel("Pixel X")
         ax_img.set_ylabel("Pixel Y")
@@ -121,6 +143,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        csv_file.close()
+        print(f"\n{log_count} readings saved to 'camera.csv'.")
         sock.close()
         print("Disconnected.")
 
