@@ -11,4 +11,6 @@ wheels/
 
 # Data files
 *.csv
+*.json
+*.png
 
