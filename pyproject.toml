@@ -5,8 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "gymnasium>=1.2.3",
     "matplotlib>=3.10.8",
     "pylablib>=1.4.4",
     "pyueye>=4.96.952",
+    "rich>=14.3.3",
+    "stable-baselines3>=2.7.1",
+    "tensorboard>=2.20.0",
     "toptica-lasersdk>=3.3.0",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "tqdm>=4.67.3",
 ]
