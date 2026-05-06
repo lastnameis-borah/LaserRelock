@@ -18,12 +18,12 @@ from scipy.spatial import cKDTree
 INDEX_PATH = "/home/artiq/LaserRelock/ml_mode_finder/checkpoints/scan_index.npz"
 
 # Hardware ranges
-I_MIN, I_MAX = 89.0, 92.0
+I_MIN, I_MAX = 89.5, 92.0
 V_MIN, V_MAX = 20.0, 60.0
 
 # Target frequency
 FREQ_TARGET = 434.829040
-FREQ_WINDOW = 0.000003
+FREQ_WINDOW = 0.000005
 
 # kNN consensus
 RECENT_SCANS = 5             # use only the latest N scans (laser drifts week-to-week)
@@ -35,6 +35,7 @@ GRID_CURRENT_STEP = 0.1
 GRID_PIEZO_STEP = 0.1
 MODE_HOP_THRESHOLD_THZ = 0.001  # 1 GHz between adjacent cells = mode hop
 MIN_MHF_WIDTH_V = 2.0
+MAX_MHF_WIDTH_V = 15.0  # wider than this is likely a kNN artifact
 
 
 class ConsensusMap:
@@ -93,7 +94,8 @@ class ConsensusMap:
 def find_target_regions(freq_grid, stable_grid, currents, piezos,
                          freq_target=FREQ_TARGET,
                          hop_threshold=MODE_HOP_THRESHOLD_THZ,
-                         min_width_V=MIN_MHF_WIDTH_V):
+                         min_width_V=MIN_MHF_WIDTH_V,
+                         max_width_V=MAX_MHF_WIDTH_V):
     """Find per-current MHF segments crossing target. Returns list of dicts."""
     candidates = []
     for i, cur in enumerate(currents):
@@ -127,7 +129,7 @@ def find_target_regions(freq_grid, stable_grid, currents, piezos,
         for s, e in runs:
             p_start, p_end = piezos[s], piezos[e]
             width = p_end - p_start
-            if width < min_width_V:
+            if width < min_width_V or width > max_width_V:
                 continue
             seg_p = piezos[s:e + 1]
             seg_f = f_line[s:e + 1]
