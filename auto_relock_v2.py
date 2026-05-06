@@ -1,6 +1,9 @@
 import time
 import sys
 import csv
+import socket
+import struct
+import numpy as np
 import wlmData
 import wlmConst
 import matplotlib.pyplot as plt
@@ -17,15 +20,15 @@ CHANNEL = 3
 TOPTICA_IP = "172.29.13.247"
 TOPTICA_PORT = 1998
 LASER_NAME = "testbed689"
-OUTPUT_FILE = "relock_log_ch%d_%s.csv" % (CHANNEL, datetime.now().strftime("%Y%m%d_%H%M%S"))
+OUTPUT_FILE = "relock_log_v2_ch%d_%s.csv" % (CHANNEL, datetime.now().strftime("%Y%m%d_%H%M%S"))
 
 # Target Frequency Window (10 MHz)
-FREQ_MIN = 434.829035
-FREQ_MAX = 434.829045
+FREQ_MIN = 434.829030
+FREQ_MAX = 434.829050
 
 # Piezo safety params
 VOLTAGE_MIN = 20.0  # V
-VOLTAGE_MAX = 50.0  # V
+VOLTAGE_MAX = 60.0  # V
 STEP_SIZE_V = 0.01  # 10mV
 DELAY = 0.2         # s
 
@@ -39,6 +42,53 @@ CURRENT_SCAN_RANGE = 4.0    # mA range to scan (±2.0 mA from operating point)
 CURRENT_STEP = 0.1          # mA per step
 CURRENT_SETTLE = 1.0        # Seconds to wait after each current step
 MAX_MODE_RECOVERIES = 10    # Max mode recovery attempts before giving up
+
+# Camera server (Thorlabs DCC1545M via camera_server.py)
+CAMERA_IP = "172.29.13.140"
+CAMERA_PORT = 5556
+ROI_X1, ROI_Y1 = 395, 430
+ROI_X2, ROI_Y2 = 595, 630
+
+
+def recv_exact(sock, n):
+    data = b''
+    while len(data) < n:
+        chunk = sock.recv(min(n - len(data), 65536))
+        if not chunk:
+            raise ConnectionError("Camera server disconnected")
+        data += chunk
+    return data
+
+
+def get_roi_intensity(sock):
+    """Request a frame and return ROI mean, or None on failure."""
+    try:
+        sock.sendall(b'FRAME')
+        header = recv_exact(sock, 8)
+        h, w = struct.unpack('>II', header)
+        if h == 0 or w == 0:
+            return None
+        data = recv_exact(sock, h * w)
+        frame = np.frombuffer(data, dtype=np.uint8).reshape(h, w)
+        roi = frame[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
+        return float(np.mean(roi))
+    except Exception as e:
+        print(f"Camera read error: {e}")
+        return None
+
+
+def connect_camera():
+    print(f"Connecting to camera server at {CAMERA_IP}:{CAMERA_PORT}...")
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        sock.connect((CAMERA_IP, CAMERA_PORT))
+        sock.settimeout(10.0)
+        print("Camera connected.")
+        return sock
+    except Exception as e:
+        print(f"Camera unavailable ({e}). Continuing without camera.")
+        return None
 
 
 def load_wavemeter():
@@ -214,13 +264,15 @@ def try_piezo_relock(dlc, target_freq):
 times = deque()
 freq_offsets = deque()
 piezo_vals = deque()
+current_vals = deque()
+intensity_vals = deque()
 freq_base = None
 t_start = None
 
 # ─── Set up the plot ───
-fig, (ax_freq, ax_piezo) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+fig, (ax_freq, ax_piezo, ax_curr, ax_cam) = plt.subplots(4, 1, figsize=(12, 11), sharex=True)
 fig.canvas.manager.set_window_title("Auto Relock v2 — Ch%d + %s" % (CHANNEL, LASER_NAME))
-fig.subplots_adjust(left=0.10, right=0.95, top=0.93, bottom=0.08, hspace=0.25)
+fig.subplots_adjust(left=0.10, right=0.95, top=0.96, bottom=0.06, hspace=0.35)
 
 # Frequency subplot (top)
 freq_line, = ax_freq.plot([], [], 'b-o', markersize=3, linewidth=1.2)
@@ -231,12 +283,24 @@ base_label = ax_freq.text(-0.01, 1.02, "", transform=ax_freq.transAxes, fontsize
                           ha='left', va='bottom', fontweight='bold')
 freq_band = None
 
-# Piezo voltage subplot (bottom)
+# Piezo voltage subplot
 piezo_line, = ax_piezo.plot([], [], 'm-o', markersize=3, linewidth=1.2)
-ax_piezo.set_xlabel("Time (s elapsed)")
 ax_piezo.set_ylabel("Voltage (V)")
 ax_piezo.set_title("%s — Piezo Voltage" % LASER_NAME)
 ax_piezo.grid(True, alpha=0.3)
+
+# Laser current subplot
+curr_line, = ax_curr.plot([], [], 'c-o', markersize=3, linewidth=1.2)
+ax_curr.set_ylabel("Current (mA)")
+ax_curr.set_title("%s — Laser Current" % LASER_NAME)
+ax_curr.grid(True, alpha=0.3)
+
+# Camera ROI intensity subplot (bottom)
+cam_line, = ax_cam.plot([], [], 'y-o', markersize=3, linewidth=1.2)
+ax_cam.set_xlabel("Time (s elapsed)")
+ax_cam.set_ylabel("ROI Mean")
+ax_cam.set_title("Camera ROI Intensity")
+ax_cam.grid(True, alpha=0.3)
 
 
 def main():
@@ -250,6 +314,10 @@ def main():
     print(f"Connecting to {LASER_NAME} at {TOPTICA_IP}...")
     toptica_conn = NetworkConnection(TOPTICA_IP, TOPTICA_PORT)
     dlc = DLCpro(toptica_conn)
+
+    cam_sock = connect_camera()
+    if cam_sock is None:
+        ax_cam.set_title("Camera ROI Intensity (disconnected)")
 
     try:
         dlc.open()
@@ -267,7 +335,7 @@ def main():
 
         csvfile = open(OUTPUT_FILE, "w", newline="")
         writer = csv.writer(csvfile)
-        writer.writerow(["timestamp_utc", "channel", "frequency_THz", "piezo_V", "current_mA", "temp_C"])
+        writer.writerow(["timestamp_utc", "channel", "frequency_THz", "piezo_V", "current_mA", "temp_C", "roi_mean"])
         log_count = 0
         print(f"Logging to: {OUTPUT_FILE}")
 
@@ -294,15 +362,26 @@ def main():
                 times.append(elapsed)
                 freq_offsets.append(offset_ghz)
 
-            # ── Read Toptica piezo voltage ──
+            # ── Read Toptica piezo voltage + current ──
             try:
                 piezo = dlc.laser1.dl.pc.voltage_act.get()
+                current_mA = dlc.laser1.dl.cc.current_act.get()
             except Exception as e:
                 piezo = None
+                current_mA = None
                 print(f"Toptica read error: {e}")
 
             if piezo is not None:
                 piezo_vals.append(piezo)
+            if current_mA is not None:
+                current_vals.append(current_mA)
+
+            # ── Camera ROI intensity ──
+            roi_mean = None
+            if cam_sock is not None:
+                roi_mean = get_roi_intensity(cam_sock)
+            if roi_mean is not None:
+                intensity_vals.append(roi_mean)
 
             # ── Relock logic ──
             lock = dlc.laser1.dl.lock
@@ -315,15 +394,14 @@ def main():
                 # Log to CSV
                 now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                 try:
-                    current_mA = dlc.laser1.dl.cc.current_act.get()
                     temp_C = dlc.laser1.dl.tc.temp_act.get()
                 except Exception:
-                    current_mA = None
                     temp_C = None
                 writer.writerow([now_str, CHANNEL, f"{freq:.6f}",
                                  f"{current_voltage:.4f}" if current_voltage else "",
                                  f"{current_mA:.4f}" if current_mA is not None else "",
-                                 f"{temp_C:.4f}" if temp_C is not None else ""])
+                                 f"{temp_C:.4f}" if temp_C is not None else "",
+                                 f"{roi_mean:.2f}" if roi_mean is not None else ""])
                 csvfile.flush()
                 log_count += 1
 
@@ -386,7 +464,23 @@ def main():
                 ax_piezo.relim()
                 ax_piezo.autoscale_view()
 
-            return freq_line, piezo_line
+            if len(current_vals) > 0:
+                t_list = list(times)
+                c_list = list(current_vals)
+                min_len = min(len(t_list), len(c_list))
+                curr_line.set_data(t_list[-min_len:], c_list[-min_len:])
+                ax_curr.relim()
+                ax_curr.autoscale_view()
+
+            if len(intensity_vals) > 0:
+                t_list = list(times)
+                i_list = list(intensity_vals)
+                min_len = min(len(t_list), len(i_list))
+                cam_line.set_data(t_list[-min_len:], i_list[-min_len:])
+                ax_cam.relim()
+                ax_cam.autoscale_view()
+
+            return freq_line, piezo_line, curr_line, cam_line
 
         ani = animation.FuncAnimation(fig, update, interval=int(DELAY * 1000), blit=False, cache_frame_data=False)
         plt.show()
@@ -405,6 +499,11 @@ def main():
             dlc.close()
         except:
             pass
+        if cam_sock is not None:
+            try:
+                cam_sock.close()
+            except Exception:
+                pass
         print("Exiting...")
 
 if __name__ == "__main__":

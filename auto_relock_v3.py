@@ -17,15 +17,15 @@ CHANNEL = 3
 TOPTICA_IP = "172.29.13.247"
 TOPTICA_PORT = 1998
 LASER_NAME = "testbed689"
-OUTPUT_FILE = "relock_log_v3_ch%d_%s.csv" % (CHANNEL, datetime.now().strftime("%Y%m%d_%H%M%S"))
+OUTPUT_FILE = "/home/artiq/LaserRelock/relock_log/relock_log_v3_ch%d_%s.csv" % (CHANNEL, datetime.now().strftime("%Y%m%d_%H%M%S"))
 
 # Target Frequency Window (10 MHz)
-FREQ_MIN = 434.829038
-FREQ_MAX = 434.829042
+FREQ_MIN = 434.829037
+FREQ_MAX = 434.829041
 
 # Piezo safety params
 VOLTAGE_MIN = 20.0  # V
-VOLTAGE_MAX = 50.0  # V
+VOLTAGE_MAX = 60.0  # V
 STEP_SIZE_V = 0.01  # 10mV
 DELAY = 0.2         # s
 
@@ -41,13 +41,15 @@ CURRENT_SETTLE = 1.0
 MAX_MODE_RECOVERIES = 10
 
 # ─── Piezo re-centering params ───
-PIEZO_DEADBAND = 0.1      # V 
-RECENTER_CURRENT_STEP = 0.05  # mA
-RECENTER_INTERVAL = 5    # re-center every 5 update cycles
-# Sign: +1 means increasing current pushes piezo UP (toward higher V)
-#        -1 means increasing current pushes piezo DOWN
-# If piezo drifts the wrong way after starting, flip this sign.
-RECENTER_DIRECTION = -1
+PIEZO_DEADBAND = 0.1         # V — don't adjust if piezo is within this of target
+RECENTER_CURRENT_STEP = 0.01  # mA — very small nudges (was 0.05, caused mode hops)
+RECENTER_INTERVAL = 5        # re-center every N update cycles
+RECENTER_MAX_CURRENT_OFFSET = 0.5  # mA — SAFETY: max total current change from initial
+RECENTER_MAX_FAILURES = 3    # Auto-disable re-centering after this many failed nudges
+# Direction: +1 means increasing current pushes piezo UP
+#            -1 means increasing current pushes piezo DOWN
+# If piezo drifts the wrong way, flip this sign.
+RECENTER_DIRECTION = 1
 
 
 def load_wavemeter():
@@ -202,13 +204,14 @@ def try_piezo_relock(dlc, target_freq):
 times = deque()
 freq_offsets = deque()
 piezo_vals = deque()
+current_vals = deque()
 freq_base = None
 t_start = None
 
 # ─── Set up the plot ───
-fig, (ax_freq, ax_piezo) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+fig, (ax_freq, ax_piezo, ax_curr) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
 fig.canvas.manager.set_window_title("Auto Relock v3 — Ch%d + %s" % (CHANNEL, LASER_NAME))
-fig.subplots_adjust(left=0.10, right=0.95, top=0.93, bottom=0.08, hspace=0.25)
+fig.subplots_adjust(left=0.10, right=0.95, top=0.95, bottom=0.07, hspace=0.3)
 
 freq_line, = ax_freq.plot([], [], 'b-o', markersize=3, linewidth=1.2)
 ax_freq.set_ylabel("MHz")
@@ -219,11 +222,16 @@ base_label = ax_freq.text(-0.01, 1.02, "", transform=ax_freq.transAxes, fontsize
 freq_band = None
 
 piezo_line, = ax_piezo.plot([], [], 'm-o', markersize=3, linewidth=1.2)
-ax_piezo.set_xlabel("Time (s elapsed)")
 ax_piezo.set_ylabel("Voltage (V)")
 ax_piezo.set_title("%s — Piezo Voltage" % LASER_NAME)
 ax_piezo.grid(True, alpha=0.3)
 piezo_target_line = None  # Will show initial piezo target
+
+curr_line, = ax_curr.plot([], [], 'c-o', markersize=3, linewidth=1.2)
+ax_curr.set_xlabel("Time (s elapsed)")
+ax_curr.set_ylabel("Current (mA)")
+ax_curr.set_title("%s — Laser Current" % LASER_NAME)
+ax_curr.grid(True, alpha=0.3)
 
 
 def main():
@@ -232,7 +240,10 @@ def main():
     relock_attempts = 0
     mode_recoveries = 0
     initial_piezo = None      # Recorded when laser first locks
+    initial_current = None    # Recorded alongside initial piezo
     recenter_counter = 0      # Count updates to pace re-centering
+    recenter_failures = 0     # Track consecutive failed nudges
+    recenter_enabled = True   # Can be disabled if too many failures
 
     load_wavemeter()
 
@@ -261,7 +272,8 @@ def main():
 
         def update(frame):
             nonlocal relock_attempts, mode_recoveries, log_count
-            nonlocal initial_piezo, recenter_counter
+            nonlocal initial_piezo, initial_current, recenter_counter
+            nonlocal recenter_failures, recenter_enabled
             global freq_base, freq_band, piezo_target_line
 
             now = datetime.now(timezone.utc)
@@ -316,6 +328,9 @@ def main():
                 csvfile.flush()
                 log_count += 1
 
+                if current_mA is not None:
+                    current_vals.append(current_mA)
+
                 if freq > FREQ_MAX or freq < FREQ_MIN:
                     print()  # newline after status
                     # ── Stage 1: Piezo-only relock ──
@@ -328,6 +343,9 @@ def main():
                             mode_recoveries = 0
                             # Record initial piezo after successful lock
                             initial_piezo = dlc.laser1.dl.pc.voltage_act.get()
+                            initial_current = dlc.laser1.dl.cc.current_act.get()
+                            recenter_failures = 0
+                            recenter_enabled = True
                             print(f"  [RECENTER] Initial piezo target set: {initial_piezo:.3f} V")
                             # Draw target line on plot
                             if piezo_target_line is not None:
@@ -360,6 +378,9 @@ def main():
                                 relock_attempts = 0
                                 mode_recoveries = 0
                                 initial_piezo = dlc.laser1.dl.pc.voltage_act.get()
+                                initial_current = dlc.laser1.dl.cc.current_act.get()
+                                recenter_failures = 0
+                                recenter_enabled = True
                                 print(f"  [RECENTER] Initial piezo target updated: {initial_piezo:.3f} V")
                             else:
                                 print("Piezo relock failed after mode recovery.")
@@ -376,6 +397,7 @@ def main():
                     # ── Record initial piezo on first successful lock ──
                     if initial_piezo is None and lock.lock_enabled.get():
                         initial_piezo = current_voltage
+                        initial_current = current_mA
                         print(f" | [RECENTER] Initial piezo target: {initial_piezo:.3f} V", end="")
                         piezo_target_line = ax_piezo.axhline(y=initial_piezo, color='green',
                                                               linestyle='--', linewidth=1, alpha=0.7,
@@ -383,23 +405,41 @@ def main():
                         ax_piezo.legend(loc='upper right', fontsize=8)
 
                     # ── Piezo re-centering (while locked and in window) ──
-                    if initial_piezo is not None and lock.lock_enabled.get():
+                    if initial_piezo is not None and lock.lock_enabled.get() and recenter_enabled:
                         recenter_counter += 1
                         piezo_error = current_voltage - initial_piezo
 
                         if recenter_counter >= RECENTER_INTERVAL and abs(piezo_error) > PIEZO_DEADBAND:
                             recenter_counter = 0
-                            # Nudge current to push piezo back toward initial position
-                            if piezo_error > 0:
-                                # Piezo too high → nudge current to bring it down
-                                nudge = RECENTER_DIRECTION * RECENTER_CURRENT_STEP
-                            else:
-                                # Piezo too low → nudge current in opposite direction
-                                nudge = -RECENTER_DIRECTION * RECENTER_CURRENT_STEP
 
-                            new_current = current_mA + nudge
-                            dlc.laser1.dl.cc.current_set.set(new_current)
-                            print(f" | [RECENTER] Piezo {piezo_error:+.3f}V off → current {current_mA:.3f} → {new_current:.3f} mA", end="")
+                            # SAFETY: check current deviation from initial
+                            current_offset = abs(current_mA - initial_current) if initial_current else 0
+                            if current_offset >= RECENTER_MAX_CURRENT_OFFSET:
+                                print(f" | [RECENTER] SAFETY LIMIT: current {current_mA:.3f} mA is {current_offset:.3f} mA from initial — skipping", end="")
+                            else:
+                                # Nudge current to push piezo back toward initial position
+                                if piezo_error > 0:
+                                    nudge = RECENTER_DIRECTION * RECENTER_CURRENT_STEP
+                                else:
+                                    nudge = -RECENTER_DIRECTION * RECENTER_CURRENT_STEP
+
+                                new_current = current_mA + nudge
+                                dlc.laser1.dl.cc.current_set.set(new_current)
+                                print(f" | [RECENTER] Piezo {piezo_error:+.3f}V off → current {current_mA:.3f} → {new_current:.3f} mA", end="")
+
+                                # SAFETY: verify frequency is still in window after nudge
+                                time.sleep(DELAY)
+                                freq_check = get_frequency()
+                                if freq_check is not None and (freq_check < FREQ_MIN or freq_check > FREQ_MAX):
+                                    # Revert the current change!
+                                    dlc.laser1.dl.cc.current_set.set(current_mA)
+                                    recenter_failures += 1
+                                    print(f" | REVERTED (freq went to {freq_check:.6f})", end="")
+                                    if recenter_failures >= RECENTER_MAX_FAILURES:
+                                        recenter_enabled = False
+                                        print(f" | RE-CENTERING DISABLED after {RECENTER_MAX_FAILURES} failures", end="")
+                                else:
+                                    recenter_failures = 0  # Reset on success
 
                     print()  # newline after status
 
@@ -417,7 +457,15 @@ def main():
                 ax_piezo.relim()
                 ax_piezo.autoscale_view()
 
-            return freq_line, piezo_line
+            if len(current_vals) > 0:
+                t_list = list(times)
+                c_list = list(current_vals)
+                min_len = min(len(t_list), len(c_list))
+                curr_line.set_data(t_list[-min_len:], c_list[-min_len:])
+                ax_curr.relim()
+                ax_curr.autoscale_view()
+
+            return freq_line, piezo_line, curr_line
 
         ani = animation.FuncAnimation(fig, update, interval=int(DELAY * 1000), blit=False, cache_frame_data=False)
         plt.show()
