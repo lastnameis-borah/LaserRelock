@@ -37,13 +37,16 @@ DELAY             = 0.2
 SETTLE_AFTER_LOCK = 5.0
 
 # ─── Piezo sweep ─────────────────────────────────────────────────────────────
-STEP_SIZE_V     = 0.01
-STABLE_READINGS = 5
-VOLTAGE_MIN     = 20.0
-VOLTAGE_MAX     = 60.0
+STEP_COARSE_V      = 0.1   # 100 mV when out of COARSE_THRESH_MHZ from FREQ_TARGET
+STEP_FINE_V        = 0.01   # 10 mV when within COARSE_THRESH_MHZ from FREQ_TARGET
+COARSE_THRESH_MHZ  = 50.0  # switch to fine steps within this offset
+STABLE_READINGS    = 5
+VOLTAGE_MIN        = 20.0
+VOLTAGE_MAX        = 60.0
 
 # ─── Relock ──────────────────────────────────────────────────────────────────
 MAX_RELOCK_ATTEMPTS = 3
+LARGE_HOP_THZ = 0.005  # 5 GHz — offset beyond which a piezo sweep is futile
 
 # ─── Output ──────────────────────────────────────────────────────────────────
 LOG_DIR = "/home/artiq/LaserRelock/relock_log"
@@ -71,12 +74,10 @@ def get_frequency():
     f = wlmData.dll.GetFrequencyNum(CHANNEL, 0.0)
     return None if f <= 0 else f
 
-
 def _voltage_safety(v):
     if v < VOLTAGE_MIN or v > VOLTAGE_MAX:
         print(f"\n[CRITICAL] Voltage {v:.3f} V out of bounds. Exiting.")
         os._exit(1)
-
 
 def _record(writer, csvfile, elapsed, freq, piezo, current_mA, temp_c,
             lock_state, in_win):
@@ -94,12 +95,12 @@ def _record(writer, csvfile, elapsed, freq, piezo, current_mA, temp_c,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Piezo sweep + lock
+# Piezo sweep + lock attempts
 # ═════════════════════════════════════════════════════════════════════════════
 
 def piezo_sweep_and_lock(dlc, writer, csvfile, mhf_min=None, mhf_max=None):
     """
-    Walk piezo toward target freq (10 mV steps), verify stability,
+    Sweep piezo toward target freq (10 mV steps), verify stability,
     engage lock.  Appends each step to shared buffers.
     Stops if the next step would leave [mhf_min, mhf_max].
     Returns True on success.
@@ -134,13 +135,16 @@ def piezo_sweep_and_lock(dlc, writer, csvfile, mhf_min=None, mhf_max=None):
         direction = None
 
     if direction:
-        step = -STEP_SIZE_V if direction == "ABOVE" else STEP_SIZE_V
-        _buf['status'][0] = (f"Sweeping {'down' if step < 0 else 'up'} "
+        sign = -1 if direction == "ABOVE" else 1
+        _buf['status'][0] = (f"Sweeping {'down' if sign < 0 else 'up'} "
                              f"({(freq - target)*1e6:+.0f} MHz)...")
         print(f"  [SWEEP] Freq {direction} target "
-              f"({(freq - target)*1e6:+.1f} MHz). Step {step*1e3:+.1f} mV "
-              f"(MHF bounds {v_lo:.2f}–{v_hi:.2f} V)...")
-        while freq > target if direction == "ABOVE" else freq < target:
+              f"({(freq - target)*1e6:+.1f} MHz). "
+              f"MHF bounds {v_lo:.2f}–{v_hi:.2f} V")
+        while freq > FREQ_MAX if direction == "ABOVE" else freq < FREQ_MIN:
+            offset_mhz = abs(freq - target) * 1e6
+            step = sign * (STEP_COARSE_V if offset_mhz > COARSE_THRESH_MHZ
+                           else STEP_FINE_V)
             new_v = voltage + step
             if not (v_lo <= new_v <= v_hi):
                 print(f"  [SWEEP] Hit MHF bound at {new_v:.3f} V "
@@ -158,7 +162,8 @@ def piezo_sweep_and_lock(dlc, writer, csvfile, mhf_min=None, mhf_max=None):
             _record(writer, csvfile, elapsed, freq, voltage, current_mA,
                     temp_c, "sweeping", in_win)
             print(f"    V={voltage:.3f}V  f={freq:.6f} THz "
-                  f"({(freq - target)*1e6:+.1f} MHz)")
+                  f"({(freq - target)*1e6:+.1f} MHz)  "
+                  f"step={step*1e3:.0f}mV")
 
     _buf['status'][0] = "Checking stability..."
     print(f"  [SWEEP] Checking stability ({STABLE_READINGS} reads)...")
@@ -318,8 +323,9 @@ def _worker(dlc, writer, csvfile):
             in_mhf = (locked_cand is not None
                       and locked_cand["mhf_piezo_min_V"] <= piezo
                       <= locked_cand["mhf_piezo_max_V"])
+            large_hop = abs(freq - FREQ_TARGET) > LARGE_HOP_THZ
 
-            if in_mhf and relock_attempts < MAX_RELOCK_ATTEMPTS:
+            if in_mhf and not large_hop and relock_attempts < MAX_RELOCK_ATTEMPTS:
                 relock_attempts += 1
                 _buf['status'][0] = (f"Relock {relock_attempts}/"
                                      f"{MAX_RELOCK_ATTEMPTS}...")
@@ -331,8 +337,10 @@ def _worker(dlc, writer, csvfile):
                                         mhf_max=locked_cand["mhf_piezo_max_V"]):
                     relock_attempts = 0
             else:
-                reason = ("outside MHF" if not in_mhf
-                          else f"{MAX_RELOCK_ATTEMPTS} relock attempts failed")
+                reason = (f"large mode hop ({(freq-FREQ_TARGET)*1e6:+.0f} MHz)"
+                          if large_hop else
+                          "outside MHF" if not in_mhf else
+                          f"{MAX_RELOCK_ATTEMPTS} relock attempts failed")
                 print(f"\n[RELOCK] {reason} — restarting from candidate 1 "
                       f"({len(state['cands'])} in list).")
                 _buf['status'][0] = "ML relock from cand 1..."
